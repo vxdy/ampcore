@@ -251,6 +251,15 @@ export function useProjectSpeakers({
       tone: "danger",
     });
     if (!ok) return;
+    // Out of its group first, so its outputs give back what the group added.
+    const group = project.groups?.find((g) => g.speakerIds.includes(speaker.id));
+    if (group) {
+      const left = await commands.projectsSetGroupMembers(project.id, group.id, group.speakerIds.filter((id) => id !== speaker.id));
+      if (left.status !== "ok") {
+        toast.danger("Speaker not removed", { description: `Not taken out of ${group.name}: ${left.error.message}` });
+        return;
+      }
+    }
     const r = await commands.projectsRemoveSpeaker(project.id, speaker.id);
     if (r.status === "ok") onProjectUpdate(r.data);
     else toast.danger("Speaker not removed", { description: r.error.message });

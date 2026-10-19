@@ -302,14 +302,32 @@ pub fn speakers_update_from_output(
     assignment_id: String,
     channel_index: u32,
 ) -> Result<Project, AppError> {
+    let group_delay_ms = group_delay_of(&state, &project_id, &assignment_id, channel_index)?;
     edit_with_library(&app, &state, &project_id, &assignment_id, |library, assignment| {
         let channel = channel_mut(assignment, channel_index)?;
         let speaker = channel.speaker.clone().ok_or("This output has no speaker")?;
         let entry = find_entry(library, &speaker.library_id)?;
-        entry.set_way_processing(speaker.way_index, SpeakerProcessing::from_channel(channel))?;
+        // The group's delay is the group's, not the speaker's.
+        let mut processing = SpeakerProcessing::from_channel(channel);
+        processing.delay_out_ms = (processing.delay_out_ms - group_delay_ms).max(0.0);
+        entry.set_way_processing(speaker.way_index, processing)?;
         channel.speaker = Some(entry.reference(speaker.way_index)?);
         Ok(true)
     })
+}
+
+/// What the group of the project speaker on this output added to its delay.
+fn group_delay_of(state: &State<ProjectDataState>, project_id: &str, assignment_id: &str, channel_index: u32) -> Result<f64, AppError> {
+    let inner = state.0.lock().map_err(|e| e.to_string())?;
+    let project = inner.projects.iter().find(|p| p.id == project_id).ok_or("project not found")?;
+    let owner = project
+        .amp_assignments
+        .iter()
+        .find(|a| a.id == assignment_id)
+        .and_then(|a| a.channels.iter().find(|c| c.channel_index == channel_index))
+        .and_then(|c| c.speaker.as_ref())
+        .and_then(|s| s.project_speaker_id.as_deref());
+    Ok(project.group_delay_ms(owner))
 }
 
 /// One output's way, fitted to the amp it is going onto.
@@ -383,12 +401,9 @@ fn fit_ways(
 ) -> Result<Vec<FittedWay>, AppError> {
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
     let inner = &mut *guard;
-    let assignment = inner
-        .projects
-        .iter()
-        .find(|p| p.id == project_id)
-        .and_then(|p| p.amp_assignments.iter().find(|a| a.id == assignment_id))
-        .ok_or_else(|| AppError::from("amp not found"))?;
+    let project = inner.projects.iter().find(|p| p.id == project_id).ok_or_else(|| AppError::from("project not found"))?;
+    let assignment =
+        project.amp_assignments.iter().find(|a| a.id == assignment_id).ok_or_else(|| AppError::from("amp not found"))?;
     let model = assignment
         .amp_model_id
         .as_deref()
@@ -408,13 +423,16 @@ fn fit_ways(
                 .iter()
                 .find(|c| c.channel_index == channel_index)
                 .ok_or_else(|| AppError::from(format!("channel {channel_index} not found")))?;
-            let (fitted, issues) = processing.fit(channel, &cap)?;
-            let rows = fit_rows(&SpeakerProcessing::from_channel(channel), processing, &fitted);
             let mut reference = entry.reference(way)?;
             reference.project_speaker_id = item.project_speaker_id.clone().or_else(|| {
                 let held = channel.speaker.as_ref().filter(|s| s.library_id == item.library_id && s.way_index == way)?;
                 held.project_speaker_id.clone()
             });
+            // A grouped speaker's output keeps its group's delay on top of the way's.
+            let mut processing = processing.clone();
+            processing.delay_out_ms += project.group_delay_ms(reference.project_speaker_id.as_deref());
+            let (fitted, issues) = processing.fit(channel, &cap)?;
+            let rows = fit_rows(&SpeakerProcessing::from_channel(channel), &processing, &fitted);
             Ok(FittedWay { channel_index, processing: fitted, reference, output_name, issues, rows })
         })
         .collect()
@@ -548,7 +566,7 @@ pub fn projects_set_channel_speaker(
 }
 
 /// The project-level counterpart of `edit_with_library`, for project speakers.
-fn edit_project(
+pub(crate) fn edit_project(
     app: &AppHandle,
     state: &State<ProjectDataState>,
     project_id: &str,
@@ -661,16 +679,13 @@ pub fn speakers_channel_states(
     assignment_id: String,
 ) -> Result<Vec<ChannelSpeakerState>, AppError> {
     let inner = state.0.lock().map_err(|e| e.to_string())?;
-    let assignment = inner
-        .projects
-        .iter()
-        .find(|p| p.id == project_id)
-        .and_then(|p| p.amp_assignments.iter().find(|a| a.id == assignment_id))
-        .ok_or_else(|| AppError::from("amp not found"))?;
+    let project = inner.projects.iter().find(|p| p.id == project_id).ok_or_else(|| AppError::from("project not found"))?;
+    let assignment =
+        project.amp_assignments.iter().find(|a| a.id == assignment_id).ok_or_else(|| AppError::from("amp not found"))?;
     let cap = assignment
         .amp_model_id
         .as_deref()
         .and_then(|id| inner.amp_models.iter().find(|m| m.id == id))
         .map(|model| capability::resolve(model, assignment.firmware_version.as_deref()));
-    Ok(speaker_states(assignment, &inner.speakers, cap.as_ref()))
+    Ok(speaker_states(assignment, &inner.speakers, cap.as_ref(), |s| project.group_delay_ms(s.project_speaker_id.as_deref())))
 }

@@ -1,9 +1,10 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import type { Node, NodeProps } from "@xyflow/react";
-import { Spinner } from "@heroui/react";
-import { Speaker } from "lucide-react";
-import type { ChannelSpeakerState, ProjectSpeaker } from "../lib/bindings";
+import { Slider, Spinner } from "@heroui/react";
+import { Layers, Speaker, Volume2, VolumeX } from "lucide-react";
+import type { ChannelSpeakerState, ProjectSpeaker, SpeakerGroup } from "../lib/bindings";
 import { speakerFields } from "../lib/speakers";
+import { CommitNumberInput } from "./CommitNumberInput";
 import { Hint } from "./Hint";
 import { MUTED } from "./SpeakerBench";
 import { FIELD_INPUT } from "./fieldClasses";
@@ -99,7 +100,25 @@ export interface SpeakerCanvas {
   arm: (armed: Armed) => void;
   /** Ends renaming; an empty or unchanged name is left alone. */
   rename: (speaker: ProjectSpeaker, name: string) => void;
+  /** Members of the selected group: lit, so the group shows what it runs. */
+  groupLit: string[];
+  /** Ends renaming a group, as `rename`. */
+  renameGroup: (group: SpeakerGroup, name: string) => void;
+  setGroupLevels: (group: SpeakerGroup, levels: GroupLevels) => void;
 }
+
+/** A change to a group's control; what is left out stays. */
+export interface GroupLevels {
+  gainDb?: number;
+  delayMs?: number;
+  muted?: boolean;
+}
+
+/** The gain fader's travel on a group tile. The amp's own range is wider; the
+ * bar's field reaches all of it. */
+export const GROUP_FADER = { min: -40, max: 12, step: 0.5 } as const;
+/** The fader's height on a group tile. */
+export const GROUP_FADER_H = 120;
 
 export const SpeakerCanvasContext = createContext<SpeakerCanvas | null>(null);
 
@@ -116,6 +135,8 @@ export type SpeakerNodeData = {
   busy: boolean;
   /** Being written to its amp right now: blurred under a spinner. */
   pending: boolean;
+  /** The name of the group it is in. */
+  group: string | null;
   ways: Array<{
     wayIndex: number;
     label: string;
@@ -134,7 +155,7 @@ function SpeakerTile({ data, selected }: NodeProps<SpeakerNodeType>) {
   const linking = canvas.tool === "link";
   const armed = canvas.armed?.speakerId === speaker.id ? canvas.armed.ways : [];
   const canArm = linking && data.linkable && !data.busy;
-  const lit = linking ? armed.length > 0 || canvas.highlighted === speaker.id : !!selected;
+  const lit = linking ? armed.length > 0 || canvas.highlighted === speaker.id : !!selected || canvas.groupLit.includes(speaker.id);
 
   // The dot is for what needs doing (Re-apply), in every tool. Being linked
   // is not a status: it says nothing about the amp, which may be offline.
@@ -154,6 +175,7 @@ function SpeakerTile({ data, selected }: NodeProps<SpeakerNodeType>) {
         ...field("Model", data.model),
         ...field("Application", data.application),
         ...field("Parallel", (speaker.parallel ?? 1) > 1 ? `${speaker.parallel} cabinets on the same outputs` : ""),
+        ...field("Group", data.group ?? ""),
         ...ways.map((w): [string, ReactNode] => [
           ways.length > 1 ? `${w.label || `Way ${w.wayIndex + 1}`} output` : "Output",
           w.output ? `${w.output.label}${statusText(w.state)}` : "Not linked",
@@ -175,15 +197,7 @@ function SpeakerTile({ data, selected }: NodeProps<SpeakerNodeType>) {
         onClick={() => canArm && canvas.arm({ speakerId: speaker.id, ways: ways.map((w) => w.wayIndex) })}
       >
         {dot && <Dot color={dot} />}
-        {/* Always mounted, so it fades in and out instead of popping. */}
-        <div
-          aria-hidden={!data.pending}
-          className={`absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-background/40 backdrop-blur-sm transition-opacity duration-300 ${
-            data.pending ? "opacity-100" : "pointer-events-none opacity-0"
-          }`}
-        >
-          <Spinner size="sm" />
-        </div>
+        <PendingVeil pending={data.pending} />
         <Cabinets count={speaker.parallel ?? 1} />
         {canvas.renaming === speaker.id ? (
           <input
@@ -224,8 +238,158 @@ function SpeakerTile({ data, selected }: NodeProps<SpeakerNodeType>) {
   );
 }
 
+/** Blurs a tile under a spinner while it is written. Always mounted, so it
+ * fades in and out instead of popping. */
+function PendingVeil({ pending }: { pending: boolean }) {
+  return (
+    <div
+      aria-hidden={!pending}
+      className={`absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-background/40 backdrop-blur-sm transition-opacity duration-300 ${
+        pending ? "opacity-100" : "pointer-events-none opacity-0"
+      }`}
+    >
+      <Spinner size="sm" />
+    </div>
+  );
+}
+
+/** Width of a group's control tile. */
+export const GROUP_CONTROL_W = 184;
+
+export type GroupNodeData = {
+  group: SpeakerGroup;
+  /** Being written to its members' amps: the controls wait. */
+  busy: boolean;
+};
+export type GroupNodeType = Node<GroupNodeData, "group">;
+
+const formatDb = (db: number) => `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
+
+/** A group's control, a tile like a speaker's: its picture and name, then a
+ * gain fader, its gain and delay, and one mute for every member. Selecting it
+ * lights its members and puts gain and delay fields in the speaker bar. */
+function GroupTile({ data, selected }: NodeProps<GroupNodeType>) {
+  const canvas = useContext(SpeakerCanvasContext)!;
+  const { group, busy } = data;
+  const gain = group.gainDb ?? 0;
+  const delay = group.delayMs ?? 0;
+  const muted = !!group.muted;
+  // The fader moves locally and writes once, when it is let go.
+  const [draft, setDraft] = useState(gain);
+  useEffect(() => setDraft(gain), [gain]);
+  const disabled = busy || canvas.tool !== "select";
+  const count = group.speakerIds.length;
+
+  return (
+    <Hint
+      text={
+        <TileTooltip
+          rows={[
+            ["Group", group.name],
+            ["Speakers", String(count)],
+            ["Gain", `${formatDb(gain)} on every member output's volume`],
+            ["Delay", `${delay.toFixed(2)} ms on top of every member's own`],
+            ["Mute", muted ? "Every member output is muted" : "Off"],
+          ]}
+        />
+      }
+      className="flex w-full"
+    >
+      <div className={`${TILE} ${frame(!!selected)} cursor-default`}>
+        {muted && <Dot color="var(--amp-color-red-filled)" />}
+        <PendingVeil pending={busy} />
+        <Layers size={30} className="text-[var(--amp-color-dimmed)]" />
+        {canvas.renaming === group.id ? (
+          <input
+            autoFocus
+            aria-label="Group name"
+            className={`${FIELD_INPUT} nodrag w-full text-center text-xs`}
+            defaultValue={group.name}
+            maxLength={40}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => canvas.renameGroup(group, e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+          />
+        ) : (
+          <span className={NAME}>{group.name}</span>
+        )}
+        <span className={`${MUTED} -mt-1`}>{count === 1 ? "1 speaker" : `${count} speakers`}</span>
+        <div className="nodrag nowheel flex w-full items-stretch gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
+          {/* The fader, as the limiter's: moves locally, writes once when let go. */}
+          <div
+            className="flex flex-col items-center gap-1"
+            style={{ opacity: disabled ? 0.45 : 1 }}
+            onDoubleClick={() => !disabled && canvas.setGroupLevels(group, { gainDb: 0 })}
+          >
+            <Slider
+              aria-label={`${group.name} gain`}
+              orientation="vertical"
+              style={{ height: GROUP_FADER_H }}
+              minValue={GROUP_FADER.min}
+              maxValue={GROUP_FADER.max}
+              step={GROUP_FADER.step}
+              value={Math.min(GROUP_FADER.max, Math.max(GROUP_FADER.min, draft))}
+              isDisabled={disabled}
+              onChange={(v) => setDraft(v as number)}
+              onChangeEnd={(v) => v !== gain && canvas.setGroupLevels(group, { gainDb: v as number })}
+            >
+              <Slider.Track>
+                <Slider.Fill />
+                <Slider.Thumb />
+              </Slider.Track>
+            </Slider>
+            <span className="text-[10px] tabular-nums text-[var(--amp-color-dimmed)]">{formatDb(draft)}</span>
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">
+            <label className="flex flex-col gap-0.5">
+              <span className={`${MUTED} uppercase`}>Gain</span>
+              <CommitNumberInput
+                className="py-0.5 tabular-nums"
+                value={Number(gain.toFixed(2))}
+                min={-80}
+                max={18}
+                step={0.5}
+                suffix=" dB"
+                onCommit={(gainDb) => !disabled && canvas.setGroupLevels(group, { gainDb })}
+              />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              <span className={`${MUTED} uppercase`}>Delay</span>
+              <CommitNumberInput
+                className="py-0.5 tabular-nums"
+                value={Number(delay.toFixed(2))}
+                min={0}
+                max={20}
+                step={0.01}
+                suffix=" ms"
+                onCommit={(delayMs) => !disabled && canvas.setGroupLevels(group, { delayMs })}
+              />
+            </label>
+          </div>
+        </div>
+        <button
+          type="button"
+          aria-pressed={muted}
+          aria-label={muted ? `Unmute ${group.name}` : `Mute ${group.name}`}
+          disabled={disabled}
+          className={`nodrag flex h-6 w-full cursor-pointer items-center justify-center gap-1 rounded-md border border-solid text-[11px] font-semibold disabled:cursor-default disabled:opacity-50 ${
+            muted ? "border-[var(--amp-color-red-filled)] bg-[var(--amp-color-red-filled)] text-white" : `${FREE} bg-transparent`
+          }`}
+          onClick={(e) => {
+            e.stopPropagation();
+            canvas.setGroupLevels(group, { muted: !muted });
+          }}
+        >
+          {muted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+          {muted ? "Muted" : "Mute"}
+        </button>
+      </div>
+    </Hint>
+  );
+}
+
 // Module level: React Flow re-mounts every node when this changes identity.
-export const NODE_TYPES = { speaker: SpeakerTile };
+export const NODE_TYPES = { speaker: SpeakerTile, group: GroupTile };
 
 const SQUARE = "h-[18px] min-w-[18px] cursor-pointer rounded-sm border border-solid px-1 text-[10px] leading-none font-bold disabled:cursor-default";
 // A linked way: the same fixed green as a linked output on the amp card.

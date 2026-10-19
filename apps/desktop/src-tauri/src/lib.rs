@@ -43,6 +43,10 @@ use commands::projects::{
     projects_set_matrix_crosspoint, projects_set_output_bridge, projects_update,
     projects_set_source_trim, projects_set_backup_priority,
 };
+use commands::groups::{
+    projects_create_group, projects_delete_group, projects_rename_group, projects_set_group_levels, projects_set_group_members,
+    projects_set_group_position,
+};
 use commands::speakers::{
     projects_add_speaker, projects_remove_speaker, projects_rename_speaker, projects_set_speaker_position, projects_set_channel_speaker, speakers_apply, speakers_channel_states, speakers_delete, speakers_fit, speakers_import_profiles, speakers_list,
     speakers_save_from_outputs, speakers_update_details, speakers_update_from_output, speakers_create, speakers_duplicate, speakers_set_way_processing,
@@ -91,6 +95,12 @@ pub fn run() {
             projects_rename_speaker,
             projects_remove_speaker,
             projects_set_speaker_position,
+            projects_create_group,
+            projects_set_group_members,
+            projects_set_group_levels,
+            projects_rename_group,
+            projects_set_group_position,
+            projects_delete_group,
             speakers_apply,
             speakers_list,
             speakers_import_profiles,

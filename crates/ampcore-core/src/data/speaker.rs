@@ -579,12 +579,15 @@ pub struct ChannelSpeakerState {
 
 /// With `cap`, the output is compared against the way as `fit` would write it
 /// onto this amp, so "Match" means "holds what applying would write" — a way
-/// the amp had to clamp must not read "Edited" for ever.
+/// the amp had to clamp must not read "Edited" for ever. `group_delay_ms` is
+/// what the speaker's group added to the output delay
+/// (`Project::group_delay_ms`); it is not the speaker's, so it is taken out.
 pub fn speaker_status(
     channel: &AmpChannel,
     speaker: &SpeakerRef,
     library: &[SpeakerLibraryEntry],
     cap: Option<&AmpCapability>,
+    group_delay_ms: f64,
 ) -> SpeakerStatus {
     let Some(entry) = library.iter().find(|e| e.id == speaker.library_id) else {
         return SpeakerStatus::Detached;
@@ -593,7 +596,9 @@ pub fn speaker_status(
         return SpeakerStatus::Detached;
     };
     let fitted = cap.and_then(|cap| way.processing.fit(channel, cap).ok()).map(|(fitted, _)| fitted);
-    let fields = fitted.as_ref().unwrap_or(&way.processing).differences(&SpeakerProcessing::from_channel(channel));
+    let mut held = SpeakerProcessing::from_channel(channel);
+    held.delay_out_ms -= group_delay_ms;
+    let fields = fitted.as_ref().unwrap_or(&way.processing).differences(&held);
     if entry.revision != speaker.revision {
         SpeakerStatus::LibraryUpdated { fields }
     } else if fields.is_empty() {
@@ -608,6 +613,7 @@ pub fn speaker_states(
     assignment: &AmpAssignment,
     library: &[SpeakerLibraryEntry],
     cap: Option<&AmpCapability>,
+    group_delay_ms: impl Fn(&SpeakerRef) -> f64,
 ) -> Vec<ChannelSpeakerState> {
     assignment
         .channels
@@ -617,7 +623,7 @@ pub fn speaker_states(
             Some(ChannelSpeakerState {
                 channel_index: channel.channel_index,
                 speaker: speaker.clone(),
-                status: speaker_status(channel, speaker, library, cap),
+                status: speaker_status(channel, speaker, library, cap, group_delay_ms(speaker)),
             })
         })
         .collect()
@@ -650,26 +656,32 @@ mod tests {
         let speaker = entry.reference(0).unwrap();
         assert_eq!(speaker.label, "Seeburg Hi");
         let library = vec![entry.clone()];
-        assert!(matches!(speaker_status(&ch, &speaker, &library, None), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, None, 0.0), SpeakerStatus::Match));
 
         // f32 wire rounding must not read as an edit.
         ch.delay_out_ms = 2.5 + 1e-9;
-        assert!(matches!(speaker_status(&ch, &speaker, &library, None), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, None, 0.0), SpeakerStatus::Match));
+
+        // A group's delay on top is not an edit of the speaker.
+        ch.delay_out_ms += 4.0;
+        assert!(matches!(speaker_status(&ch, &speaker, &library, None, 4.0), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, None, 0.0), SpeakerStatus::Edited { .. }));
+        ch.delay_out_ms -= 4.0;
 
         ch.output_eq.bands[2].gain_db += 1.5;
         ch.output_eq.bands[2].active = true;
-        match speaker_status(&ch, &speaker, &library, None) {
+        match speaker_status(&ch, &speaker, &library, None, 0.0) {
             SpeakerStatus::Edited { fields } => assert_eq!(fields, ["EQ · Band 3"]),
             other => panic!("{other:?}"),
         }
 
         entry.set_way_processing(0, SpeakerProcessing::from_channel(&ch)).unwrap();
-        match speaker_status(&ch, &speaker, &[entry.clone()], None) {
+        match speaker_status(&ch, &speaker, &[entry.clone()], None, 0.0) {
             SpeakerStatus::LibraryUpdated { fields } => assert!(fields.is_empty()),
             other => panic!("{other:?}"),
         }
 
-        assert!(matches!(speaker_status(&ch, &speaker, &[], None), SpeakerStatus::Detached));
+        assert!(matches!(speaker_status(&ch, &speaker, &[], None, 0.0), SpeakerStatus::Detached));
     }
 
     /// A way whose peak sits below the floor used to read "Edited" forever:
@@ -686,7 +698,7 @@ mod tests {
         let mut ch = channel();
         processing.apply_to(&mut ch);
         let speaker = entry.reference(0).unwrap();
-        assert!(matches!(speaker_status(&ch, &speaker, &[entry], None), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &[entry], None, 0.0), SpeakerStatus::Match));
     }
 
     fn capability(firmware: &str) -> AmpCapability {
@@ -762,10 +774,10 @@ mod tests {
         let speaker = entry.reference(0).unwrap();
         way.fit(&ch, &cap).unwrap().0.apply_to(&mut ch);
         let library = [entry];
-        assert!(matches!(speaker_status(&ch, &speaker, &library, Some(&cap)), SpeakerStatus::Match));
-        assert!(matches!(speaker_status(&ch, &speaker, &library, None), SpeakerStatus::Edited { .. }));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, Some(&cap), 0.0), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, None, 0.0), SpeakerStatus::Edited { .. }));
         ch.delay_out_ms = 3.0;
-        assert!(matches!(speaker_status(&ch, &speaker, &library, Some(&cap)), SpeakerStatus::Edited { .. }));
+        assert!(matches!(speaker_status(&ch, &speaker, &library, Some(&cap), 0.0), SpeakerStatus::Edited { .. }));
     }
 
     #[test]
@@ -805,9 +817,9 @@ mod tests {
         assert!(fitted.fir.as_ref().is_some_and(|f| f.same_taps(&fir.coefficients)), "1.1.8 has FIR, so it is kept");
         entry.ways[0].processing.apply_to(&mut ch);
         let speaker = entry.reference(0).unwrap();
-        assert!(matches!(speaker_status(&ch, &speaker, &[entry.clone()], None), SpeakerStatus::Match));
+        assert!(matches!(speaker_status(&ch, &speaker, &[entry.clone()], None, 0.0), SpeakerStatus::Match));
         ch.fir = ChannelFir::identity();
-        match speaker_status(&ch, &speaker, &[entry], None) {
+        match speaker_status(&ch, &speaker, &[entry], None, 0.0) {
             SpeakerStatus::Edited { fields } => assert_eq!(fields, ["FIR filter"]),
             other => panic!("{other:?}"),
         }

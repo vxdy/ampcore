@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::capability::{CrossoverFilterType, EqFilterType, PowerMode, SourceKind};
+use super::capability::{CrossoverFilterType, EqFilterType, ParamRange, PowerMode, SourceKind};
 use super::common::{new_id, now_millis};
 use crate::live::cvr::fir::{taps_summary, trimmed_taps};
 
@@ -414,6 +414,55 @@ impl ProjectSpeaker {
     }
 }
 
+/// Project speakers run from one control: a gain, a delay and a mute for all
+/// of them. A speaker is in at most one group.
+///
+/// The group holds no channel of its own. Its gain and delay are offsets that
+/// have already been added to its members' outputs — gain to the output
+/// volume, delay to the output delay — so the push, the fingerprint and the
+/// amp know nothing of groups (`Project::shift_speakers`). The delay part is
+/// taken back out wherever an output is compared with or saved as its library
+/// way (`Project::group_delay_ms`), so a grouped speaker still reads "Match".
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerGroup {
+    pub id: String,
+    pub name: String,
+    pub speaker_ids: Vec<String>,
+    /// Where its control sits on the Workspace canvas; `None` until dragged.
+    #[serde(default)]
+    pub position: Option<CanvasPosition>,
+    #[serde(default)]
+    pub gain_db: f64,
+    #[serde(default)]
+    pub delay_ms: f64,
+    /// Every member output is muted. Unmuting unmutes them all.
+    #[serde(default)]
+    pub muted: bool,
+}
+
+impl SpeakerGroup {
+    pub fn new(name: String) -> Self {
+        Self { id: new_id(), name, speaker_ids: Vec::new(), position: None, gain_db: 0.0, delay_ms: 0.0, muted: false }
+    }
+}
+
+/// The ranges a group's shift must keep an amp's outputs in.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputLimits {
+    pub volume_db: ParamRange,
+    pub delay_out_ms: ParamRange,
+}
+
+/// What `Project::shift_speakers` changed: the offsets it could apply (the
+/// asked ones, cut so no output leaves its range) and the amps it touched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shifted {
+    pub gain_db: f64,
+    pub delay_ms: f64,
+    pub amp_ids: Vec<String>,
+}
+
 /// One assigned amp "slot" within a Project. `id` is independent of `mac` so
 /// a slot's configuration survives a physical unit swap. `mac` starts unset
 /// at creation time — a slot is planned by model/name alone; linking it to
@@ -462,6 +511,8 @@ pub struct Project {
     pub amp_assignments: Vec<AmpAssignment>,
     #[serde(default)]
     pub speakers: Vec<ProjectSpeaker>,
+    #[serde(default)]
+    pub groups: Vec<SpeakerGroup>,
 }
 
 /// A version stamp only — nothing reads it to gate behavior. There are no
@@ -482,7 +533,9 @@ pub struct Project {
 ///
 /// 5: `ProjectSpeaker.parallel` — absent in older files, which backfills to 1
 /// (a single cabinet).
-pub const CURRENT_PROJECT_SCHEMA_VERSION: u32 = 5;
+///
+/// 6: `Project.groups` — absent in older files, which backfills to no groups.
+pub const CURRENT_PROJECT_SCHEMA_VERSION: u32 = 6;
 
 impl Project {
     pub fn new(name: String, description: String) -> Self {
@@ -496,6 +549,7 @@ impl Project {
             updated_at: now,
             amp_assignments: Vec::new(),
             speakers: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -503,10 +557,79 @@ impl Project {
         self.updated_at = now_millis();
     }
 
+    /// The group a project speaker is in, if any.
+    pub fn group_of(&self, speaker_id: &str) -> Option<&SpeakerGroup> {
+        self.groups.iter().find(|g| g.speaker_ids.iter().any(|id| id == speaker_id))
+    }
+
+    /// The delay a project speaker's group has added to its outputs; 0 for
+    /// an output that is no project speaker's or one in no group.
+    pub fn group_delay_ms(&self, project_speaker_id: Option<&str>) -> f64 {
+        project_speaker_id.and_then(|id| self.group_of(id)).map_or(0.0, |g| g.delay_ms)
+    }
+
+    /// Adds `gain_db` to the output volume and `delay_ms` to the output delay
+    /// of every output linked to these speakers, and mutes or unmutes them
+    /// with `mute`. Both offsets are first cut so that no output leaves its
+    /// amp's range (`limits`; an amp without one only keeps its delay at or
+    /// above 0) — every output then moves by the same amount, and shifting
+    /// back by what was applied restores them exactly.
+    pub fn shift_speakers(
+        &mut self,
+        speaker_ids: &[String],
+        gain_db: f64,
+        delay_ms: f64,
+        mute: Option<bool>,
+        limits: impl Fn(&AmpAssignment) -> Option<OutputLimits>,
+    ) -> Shifted {
+        let member = |c: &AmpChannel| {
+            c.speaker.as_ref().and_then(|s| s.project_speaker_id.as_ref()).is_some_and(|id| speaker_ids.contains(id))
+        };
+        let (mut gain_lo, mut gain_hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        let (mut delay_lo, mut delay_hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for amp in &self.amp_assignments {
+            let limits = limits(amp);
+            for channel in amp.channels.iter().filter(|c| member(c)) {
+                let delay = limits.map_or(ParamRange { min: 0.0, max: f64::INFINITY }, |l| l.delay_out_ms);
+                delay_lo = delay_lo.max(delay.min - channel.delay_out_ms);
+                delay_hi = delay_hi.min(delay.max - channel.delay_out_ms);
+                if let Some(l) = limits {
+                    gain_lo = gain_lo.max(l.volume_db.min - channel.output_volume_db);
+                    gain_hi = gain_hi.min(l.volume_db.max - channel.output_volume_db);
+                }
+            }
+        }
+        // An output already outside its range leaves no room either way.
+        let cut = |v: f64, lo: f64, hi: f64| if lo > hi { 0.0 } else { v.clamp(lo.min(0.0), hi.max(0.0)) };
+        let (gain_db, delay_ms) = (cut(gain_db, gain_lo, gain_hi), cut(delay_ms, delay_lo, delay_hi));
+
+        let mut amp_ids = Vec::new();
+        for amp in &mut self.amp_assignments {
+            let mut touched = false;
+            for channel in amp.channels.iter_mut().filter(|c| member(c)) {
+                channel.output_volume_db += gain_db;
+                channel.delay_out_ms += delay_ms;
+                if let Some(muted) = mute {
+                    channel.output_muted = muted;
+                }
+                touched = true;
+            }
+            if touched {
+                amp_ids.push(amp.id.clone());
+            }
+        }
+        Shifted { gain_db, delay_ms, amp_ids }
+    }
+
     /// Removes a project speaker. The outputs it was linked to keep their
-    /// values and their library reference, as speakers set up on the amp.
+    /// values and their library reference, as speakers set up on the amp —
+    /// including what its group added to them; take it out of the group
+    /// first to give that back.
     pub fn remove_speaker(&mut self, speaker_id: &str) {
         self.speakers.retain(|s| s.id != speaker_id);
+        for group in &mut self.groups {
+            group.speaker_ids.retain(|id| id != speaker_id);
+        }
         for channel in self.amp_assignments.iter_mut().flat_map(|a| &mut a.channels) {
             if let Some(speaker) = &mut channel.speaker {
                 if speaker.project_speaker_id.as_deref() == Some(speaker_id) {
@@ -685,6 +808,44 @@ fn default_channel_eq() -> ChannelEq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifting_a_group_moves_every_member_output_by_the_same_cut_offset() {
+        let mut project = Project::new("p".into(), String::new());
+        let mut amp = AmpAssignment::new(None, None, 3, None, None);
+        for (channel, owner) in amp.channels.iter_mut().zip(["a", "b", "x"]) {
+            channel.speaker = Some(SpeakerRef {
+                library_id: "lib".into(),
+                way_index: 0,
+                revision: 1,
+                label: String::new(),
+                project_speaker_id: Some(owner.into()),
+            });
+        }
+        amp.channels[0].output_volume_db = 4.0;
+        amp.channels[1].delay_out_ms = 2.0;
+        project.amp_assignments.push(amp);
+        let limits = |_: &AmpAssignment| {
+            Some(OutputLimits {
+                volume_db: ParamRange { min: -80.0, max: 6.0 },
+                delay_out_ms: ParamRange { min: 0.0, max: 20.0 },
+            })
+        };
+        let members = vec!["a".to_string(), "b".to_string()];
+
+        // Output A has only 2 dB of headroom, output B only 18 ms of delay left.
+        let shifted = project.shift_speakers(&members, 5.0, 30.0, Some(true), limits);
+        assert_eq!((shifted.gain_db, shifted.delay_ms), (2.0, 18.0));
+        let ch = &project.amp_assignments[0].channels;
+        assert_eq!((ch[0].output_volume_db, ch[1].output_volume_db, ch[2].output_volume_db), (6.0, 2.0, 0.0));
+        assert_eq!((ch[0].delay_out_ms, ch[1].delay_out_ms), (18.0, 20.0));
+        assert!(ch[0].output_muted && ch[1].output_muted && !ch[2].output_muted, "only members");
+
+        project.shift_speakers(&members, -shifted.gain_db, -shifted.delay_ms, Some(false), limits);
+        let ch = &project.amp_assignments[0].channels;
+        assert_eq!((ch[0].output_volume_db, ch[1].delay_out_ms, ch[0].delay_out_ms), (4.0, 2.0, 0.0));
+        assert!(!ch[0].output_muted);
+    }
 
     #[test]
     fn removing_a_project_speaker_leaves_its_outputs_as_amp_level_speakers() {

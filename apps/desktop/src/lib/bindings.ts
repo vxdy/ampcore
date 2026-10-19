@@ -14,6 +14,7 @@ export const commands = {
 	updatedAt: number | null,
 	ampAssignments: AmpAssignment[],
 	speakers?: ProjectSpeaker[],
+	groups?: SpeakerGroup[],
 } | null, AppError>(__TAURI_INVOKE("projects_get", { id })),
 	projectsCreate: (name: string, description: string) => typedError<Project, AppError>(__TAURI_INVOKE("projects_create", { name, description })),
 	/**
@@ -162,12 +163,12 @@ export const commands = {
 	/**  Sets a channel's output power/impedance mode — Output tab. */
 	projectsSetChannelPowerMode: (projectId: string, assignmentId: string, channelIndex: number, powerMode: PowerMode) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_channel_power_mode", { projectId, assignmentId, channelIndex, powerMode })),
 	/**
-	 *  Removes an output's speaker reference. Its values are left alone â€”
+	 *  Removes an output's speaker reference. Its values are left alone —
 	 *  `speakers_apply` is what sets a speaker up.
 	 */
 	projectsSetChannelSpeaker: (projectId: string, assignmentId: string, channelIndex: number) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_channel_speaker", { projectId, assignmentId, channelIndex })),
 	/**
-	 *  Places a library speaker in the project, linked to nothing yet â€” a group
+	 *  Places a library speaker in the project, linked to nothing yet — a group
 	 *  of `parallel` identical cabinets on the same outputs (1 = one cabinet).
 	 *  Its ways are linked by `speakers_apply` (`SpeakerItem.project_speaker_id`).
 	 */
@@ -180,6 +181,27 @@ export const commands = {
 	projectsRemoveSpeaker: (projectId: string, speakerId: string) => typedError<Project, AppError>(__TAURI_INVOKE("projects_remove_speaker", { projectId, speakerId })),
 	/**  Where the speaker sits on the Workspace canvas. */
 	projectsSetSpeakerPosition: (projectId: string, speakerId: string, x: number | null, y: number | null) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_speaker_position", { projectId, speakerId, x, y })),
+	/**
+	 *  A new group of these speakers, at 0 dB, no delay, unmuted. Speakers in
+	 *  another group move to it.
+	 */
+	projectsCreateGroup: (projectId: string, name: string, speakerIds: string[]) => typedError<Project, AppError>(__TAURI_INVOKE("projects_create_group", { projectId, name, speakerIds })),
+	projectsSetGroupMembers: (projectId: string, groupId: string, speakerIds: string[]) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_group_members", { projectId, groupId, speakerIds })),
+	/**
+	 *  Sets the group's gain, delay and/or mute (`None` leaves one as it is).
+	 *  Gain and delay move every member output by the difference; when an output
+	 *  would leave its range, all of them move only as far as it can, and the
+	 *  group shows where they got to. The delay never goes below 0.
+	 */
+	projectsSetGroupLevels: (projectId: string, groupId: string, gainDb: number | null, delayMs: number | null, muted: boolean | null) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_group_levels", { projectId, groupId, gainDb, delayMs, muted })),
+	projectsRenameGroup: (projectId: string, groupId: string, name: string) => typedError<Project, AppError>(__TAURI_INVOKE("projects_rename_group", { projectId, groupId, name })),
+	/**  Where the group's control sits on the Workspace canvas. */
+	projectsSetGroupPosition: (projectId: string, groupId: string, x: number | null, y: number | null) => typedError<Project, AppError>(__TAURI_INVOKE("projects_set_group_position", { projectId, groupId, x, y })),
+	/**
+	 *  Dissolves the group: its members get its gain and delay taken back off
+	 *  (and are unmuted if it was muted), then it is gone. The speakers stay.
+	 */
+	projectsDeleteGroup: (projectId: string, groupId: string) => typedError<Project, AppError>(__TAURI_INVOKE("projects_delete_group", { projectId, groupId })),
 	/**
 	 *  Sets outputs up from the library: each item's output gets its way's values
 	 *  (fitted to the amp), reference and label as its name. A way that doesn't
@@ -220,8 +242,8 @@ export const commands = {
 	/**  Outputs set up from the entry keep their values and read as detached. */
 	speakersDelete: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("speakers_delete", { id })),
 	/**
-	 *  Creates a library entry from consecutive outputs â€” one way per output, in
-	 *  order â€” and sets those outputs up from it.
+	 *  Creates a library entry from consecutive outputs — one way per output, in
+	 *  order — and sets those outputs up from it.
 	 */
 	speakersSaveFromOutputs: (projectId: string, assignmentId: string, channelIndices: number[], details: SpeakerDetails) => typedError<Project, AppError>(__TAURI_INVOKE("speakers_save_from_outputs", { projectId, assignmentId, channelIndices, details })),
 	/**
@@ -1939,7 +1961,7 @@ export type ProfileImportResult = {
 	error: string | null,
 	/**  The entry the file makes. Not in the library unless `commit` was set. */
 	entry: SpeakerLibraryEntry | null,
-	/**  Brand, family and model already exist in the library â€” imported anyway. */
+	/**  Brand, family and model already exist in the library — imported anyway. */
 	duplicate: boolean,
 };
 
@@ -1957,6 +1979,7 @@ export type Project = {
 	updatedAt: number | null,
 	ampAssignments: AmpAssignment[],
 	speakers?: ProjectSpeaker[],
+	groups?: SpeakerGroup[],
 };
 
 /**
@@ -2110,9 +2133,32 @@ export type SpeakerDetails = {
 };
 
 /**
+ *  Project speakers run from one control: a gain, a delay and a mute for all
+ *  of them. A speaker is in at most one group.
+ * 
+ *  The group holds no channel of its own. Its gain and delay are offsets that
+ *  have already been added to its members' outputs — gain to the output
+ *  volume, delay to the output delay — so the push, the fingerprint and the
+ *  amp know nothing of groups (`Project::shift_speakers`). The delay part is
+ *  taken back out wherever an output is compared with or saved as its library
+ *  way (`Project::group_delay_ms`), so a grouped speaker still reads "Match".
+ */
+export type SpeakerGroup = {
+	id: string,
+	name: string,
+	speakerIds: string[],
+	/**  Where its control sits on the Workspace canvas; `None` until dragged. */
+	position?: CanvasPosition | null,
+	gainDb?: number | null,
+	delayMs?: number | null,
+	/**  Every member output is muted. Unmuting unmutes them all. */
+	muted?: boolean,
+};
+
+/**
  *  One output to set up: which way of which library entry goes onto it.
  *  Entries may differ between items, so any number of speakers is one apply
- *  â€” and one push.
+ *  — and one push.
  */
 export type SpeakerItem = {
 	channelIndex: number,

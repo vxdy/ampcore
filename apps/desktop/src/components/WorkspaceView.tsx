@@ -14,9 +14,15 @@ import {
   AlignVerticalDistributeCenter,
   Columns3,
   Group,
+  Layers,
+  LogOut,
   Rows3,
+  Ungroup,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { GitCompare, Link, Link2, Link2Off, MousePointer2, Pencil, Plus, RotateCcw, SlidersHorizontal, SplitSquareVertical, Trash2 } from "lucide-react";
+import { CommitNumberInput } from "./CommitNumberInput";
 import { AmpCatalogueModal } from "./AmpCatalogueModal";
 import { AmpLinkModal } from "./AmpLinkModal";
 import { FingerprintMismatchModal, STATE_BADGE } from "./FingerprintMismatchModal";
@@ -28,16 +34,27 @@ import {
   AmpTile,
   NODE_TYPES,
   SpeakerCanvasContext,
+  GROUP_CONTROL_W,
   GROUP_TILE_W,
   TILE_W,
   type Armed,
+  type GroupLevels,
+  type GroupNodeData,
   type OutputBox,
   type SpeakerCanvas,
   type SpeakerNodeData,
   type Tool,
 } from "./WorkspaceNodes";
 import { useProjectSpeakers, type ProjectOutput } from "./useProjectSpeakers";
-import { commands, type AmpAssignment, type AmpEditLock, type AmpModelCatalogEntry, type Project } from "../lib/bindings";
+import {
+  commands,
+  type AmpAssignment,
+  type AmpEditLock,
+  type AmpModelCatalogEntry,
+  type AppError,
+  type Project,
+  type SpeakerGroup,
+} from "../lib/bindings";
 import { firmwareOptionsFor } from "../lib/firmwareOptions";
 import { useIsCompact } from "../lib/breakpoints";
 import { arrange, type Arrangement, type Rect } from "../lib/arrange";
@@ -285,7 +302,18 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
     ];
   }
 
+  const groups = project.groups ?? [];
+  const groupOf = (speakerId: string) => groups.find((g) => g.speakerIds.includes(speakerId));
+  /** The group being written, `"new"` while one is created. */
+  const [groupBusy, setGroupBusy] = useState<string | null>(null);
+
   const built = useMemo(() => {
+    const groupNodes = groups.map((group, index): Node => {
+      // Never dragged: a column to the right of the speakers' cascade.
+      const position = group.position ? { x: group.position.x ?? 0, y: group.position.y ?? 0 } : { x: 480, y: SPEAKER_GAP + index * 320 };
+      const data: GroupNodeData = { group, busy: groupBusy === group.id || speakers.busy };
+      return { id: group.id, type: "group", position, width: GROUP_CONTROL_W, deletable: false, data };
+    });
     return speakers.speakers.map((speaker, index): Node => {
       const entry = entryOf(speaker.libraryId);
       const links = speakers.outputs.filter((o) => o.speaker?.projectSpeakerId === speaker.id);
@@ -308,15 +336,16 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
         application: entry?.application ?? "",
         linkable: !!entry,
         busy: speakers.busy,
-        pending: speakers.pending.speakers.includes(speaker.id),
+        pending: speakers.pending.speakers.includes(speaker.id) || (!!groupBusy && groupOf(speaker.id)?.id === groupBusy),
+        group: groupOf(speaker.id)?.name ?? null,
         ways,
       };
       // A parallel group is one tile, wider for its row of cabinets.
       const width = (speaker.parallel ?? 1) > 1 ? GROUP_TILE_W : TILE_W;
       return { id: speaker.id, type: "speaker", position, width, deletable: false, data };
-    });
+    }).concat(groupNodes);
     // `speakers.outputs` follows `project`; `nameFor` follows `modelsById`.
-  }, [project, modelsById, speakers.library, speakers.states, speakers.busy, speakers.pending]);
+  }, [project, modelsById, speakers.library, speakers.states, speakers.busy, speakers.pending, groupBusy]);
 
   // React Flow keeps what it measured (and what is being dragged) on the node
   // objects, so a rebuild is merged into them, not swapped in.
@@ -358,6 +387,9 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
     return changes;
   }
   const selectedSpeaker = selectedNodes.length === 1 ? speakers.speakers.find((s) => s.id === selectedNodes[0].id) : undefined;
+  const selectedGroup = selectedNodes.length === 1 ? groups.find((g) => g.id === selectedNodes[0].id) : undefined;
+  /** The selected speakers, groups left out. */
+  const selectedSpeakerIds = selectedNodes.filter((n) => n.type === "speaker").map((n) => n.id);
   function clearSpeakerSelection() {
     setNodes((prev) => (prev.some((n) => n.selected) ? prev.map((n) => (n.selected ? { ...n, selected: false } : n)) : prev));
   }
@@ -367,8 +399,85 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
    * ponytail: one save per speaker; a bulk command if arranging many gets slow. */
   function savePositions(moved: Array<{ id: string; position: { x: number; y: number } }>) {
     const at = new Map(moved.map((m) => [m.id, { x: m.position.x, y: m.position.y }]));
-    onProjectUpdate({ ...project, speakers: speakers.speakers.map((s) => (at.has(s.id) ? { ...s, position: at.get(s.id)! } : s)) });
-    for (const [id, position] of at) void commands.projectsSetSpeakerPosition(project.id, id, position.x, position.y);
+    onProjectUpdate({
+      ...project,
+      speakers: speakers.speakers.map((s) => (at.has(s.id) ? { ...s, position: at.get(s.id)! } : s)),
+      groups: groups.map((g) => (at.has(g.id) ? { ...g, position: at.get(g.id)! } : g)),
+    });
+    for (const [id, position] of at) {
+      const save = groups.some((g) => g.id === id) ? commands.projectsSetGroupPosition : commands.projectsSetSpeakerPosition;
+      void save(project.id, id, position.x, position.y);
+    }
+  }
+
+  /** The amps these speakers are linked to that can't be changed now (a
+   * linked, online amp out of step with the project) — named in a toast. */
+  function refusedFor(speakerIds: string[]): boolean {
+    const amps = new Set(speakers.outputs.filter((o) => speakerIds.includes(o.speaker?.projectSpeakerId ?? "")).map((o) => o.amp));
+    const locked = [...amps].filter((a) => locks.get(a.id)?.locked);
+    if (locked.length === 0) return false;
+    toast.danger(`${locked.map(nameFor).join(", ")} can't be changed right now`, {
+      description: "It differs from this project or is still being read. Compare it from its card first.",
+    });
+    return true;
+  }
+
+  /** Runs one group change; its members spin while it is written. */
+  async function groupWrite(
+    busyId: string,
+    failure: string,
+    run: () => Promise<{ status: "ok"; data: Project } | { status: "error"; error: AppError }>,
+  ): Promise<Project | null> {
+    if (groupBusy || speakers.busy) return null;
+    setGroupBusy(busyId);
+    try {
+      const r = await run();
+      if (r.status === "ok") {
+        onProjectUpdate(r.data);
+        return r.data;
+      }
+      toast.danger(failure, { description: r.error.message });
+      return null;
+    } finally {
+      setGroupBusy(null);
+    }
+  }
+
+  function setGroupLevels(group: SpeakerGroup, levels: GroupLevels) {
+    if (refusedFor(group.speakerIds)) return;
+    void groupWrite(group.id, `${group.name} not changed`, () =>
+      commands.projectsSetGroupLevels(project.id, group.id, levels.gainDb ?? null, levels.delayMs ?? null, levels.muted ?? null),
+    );
+  }
+
+  /** A new group of these speakers, named for its place in the list; its name is then up for editing. */
+  async function createGroup(speakerIds: string[]) {
+    if (refusedFor(speakerIds)) return;
+    const known = new Set(groups.map((g) => g.id));
+    const next = await groupWrite("new", "Group not created", () => commands.projectsCreateGroup(project.id, `Group ${groups.length + 1}`, speakerIds));
+    const created = next?.groups?.find((g) => !known.has(g.id));
+    if (created) setRenaming(created.id);
+  }
+
+  function setMembers(group: SpeakerGroup, speakerIds: string[], failure: string) {
+    // The speakers that move in or out, and those leaving another group for this one.
+    if (refusedFor([...group.speakerIds, ...speakerIds])) return;
+    void groupWrite(group.id, failure, () => commands.projectsSetGroupMembers(project.id, group.id, speakerIds));
+  }
+
+  /** Takes these speakers out of whatever group they are in. */
+  async function leaveGroups(speakerIds: string[]) {
+    for (const group of groups.filter((g) => g.speakerIds.some((id) => speakerIds.includes(id)))) {
+      if (refusedFor(group.speakerIds)) return;
+      const rest = group.speakerIds.filter((id) => !speakerIds.includes(id));
+      if (!(await groupWrite(group.id, `Not taken out of ${group.name}`, () => commands.projectsSetGroupMembers(project.id, group.id, rest)))) return;
+    }
+  }
+
+  /** Dissolves the group; its members keep everything but what it added. */
+  function ungroup(group: SpeakerGroup) {
+    if (refusedFor(group.speakerIds)) return;
+    void groupWrite(group.id, `${group.name} not ungrouped`, () => commands.projectsDeleteGroup(project.id, group.id));
   }
 
   const openMenu = useContextMenu();
@@ -389,7 +498,25 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
       savePositions([...placed].map(([id, position]) => ({ id, position })));
     };
     const [few, fewer] = [targets.length < 2, targets.length < 3];
+    const speakerIds = targets.filter((n) => n.type === "speaker").map((n) => n.id);
+    const grouped = speakerIds.filter((id) => groupOf(id));
+    const groupBlocked = speakerIds.length === 0 || !!groupBusy || speakers.busy;
     openMenu(event, [
+      {
+        label: "Speaker Group",
+        icon: <Layers size={14} />,
+        disabled: groupBlocked,
+        items: [
+          { label: "New Group", icon: <Plus size={14} />, onAction: () => void createGroup(speakerIds) },
+          ...groups.map((group) => ({
+            label: `Add to ${group.name}`,
+            icon: <Layers size={14} />,
+            disabled: speakerIds.every((id) => group.speakerIds.includes(id)),
+            onAction: () => setMembers(group, [...new Set([...group.speakerIds, ...speakerIds])], `Not added to ${group.name}`),
+          })),
+          { label: "Remove from Group", icon: <LogOut size={14} />, disabled: grouped.length === 0, onAction: () => void leaveGroups(grouped) },
+        ],
+      },
       {
         label: "Align",
         icon: <AlignStartVertical size={14} />,
@@ -438,6 +565,16 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
       setRenaming(null);
       void speakers.rename(speaker, name);
     },
+    groupLit: tool === "select" ? (selectedGroup?.speakerIds ?? []) : [],
+    renameGroup: (group, name) => {
+      setRenaming(null);
+      if (!name.trim() || name.trim() === group.name) return;
+      void commands.projectsRenameGroup(project.id, group.id, name).then((r) => {
+        if (r.status === "ok") onProjectUpdate(r.data);
+        else toast.danger("Group not renamed", { description: r.error.message });
+      });
+    },
+    setGroupLevels,
   };
 
   function openEdit(assignment: AmpAssignment) {
@@ -502,6 +639,7 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
   const divider = <span className="mx-1 h-5 w-px shrink-0 bg-[var(--amp-color-default-border)]" />;
   const BAR_EDGE = "border-0 border-solid border-[var(--amp-color-default-border)]";
   const selecting = tool === "select";
+  const groupsBusy = !!groupBusy || speakers.busy;
 
   return (
     <div className={`flex h-full min-h-0 min-w-0 flex-col ${compact ? "overflow-y-auto" : ""}`}>
@@ -618,7 +756,10 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
           {selecting && selectedNodes.length > 1 && (
             <>
               {divider}
-              <span className="min-w-0 truncate text-sm font-semibold">{selectedNodes.length} speakers</span>
+              <span className="min-w-0 truncate text-sm font-semibold">
+                {selectedNodes.length} {selectedSpeakerIds.length === selectedNodes.length ? "speakers" : "tiles"}
+              </span>
+              {selectedSpeakerIds.length > 0 && action("Group", <Layers size={14} />, () => void createGroup(selectedSpeakerIds), "secondary", groupsBusy)}
               <span className="min-w-0 truncate text-sm" style={{ color: "var(--amp-color-dimmed)" }}>Right-click to align or distribute</span>
             </>
           )}
@@ -629,7 +770,49 @@ export const WorkspaceView = memo(function WorkspaceView({ project, onProjectUpd
               {action("Rename", <Pencil size={14} />, () => setRenaming(selectedSpeaker.id))}
               {speakers.staleSpeakers.includes(selectedSpeaker) &&
                 action("Re-apply", <RotateCcw size={14} />, () => void speakers.reapply([selectedSpeaker]), "secondary", speakers.busy)}
+              {groupOf(selectedSpeaker.id)
+                ? action(`Leave ${groupOf(selectedSpeaker.id)!.name}`, <LogOut size={14} />, () => void leaveGroups([selectedSpeaker.id]), "secondary", groupsBusy)
+                : action("Group", <Layers size={14} />, () => void createGroup([selectedSpeaker.id]), "secondary", groupsBusy)}
               {action("Remove", <Trash2 size={14} />, () => void speakers.remove(selectedSpeaker), "danger", speakers.busy)}
+            </>
+          )}
+          {selecting && selectedGroup && (
+            <>
+              {divider}
+              <span className="min-w-0 truncate text-sm font-semibold">{selectedGroup.name}</span>
+              <Hint text="Added to every member output's volume" className="flex shrink-0">
+                <CommitNumberInput
+                  className="w-24"
+                  value={Number((selectedGroup.gainDb ?? 0).toFixed(2))}
+                  min={-80}
+                  max={18}
+                  step={0.5}
+                  showStepper
+                  suffix=" dB"
+                  onCommit={(gainDb) => setGroupLevels(selectedGroup, { gainDb })}
+                />
+              </Hint>
+              <Hint text="Added to every member output's own delay" className="flex shrink-0">
+                <CommitNumberInput
+                  className="w-24"
+                  value={Number((selectedGroup.delayMs ?? 0).toFixed(2))}
+                  min={0}
+                  max={20}
+                  step={0.01}
+                  showStepper
+                  suffix=" ms"
+                  onCommit={(delayMs) => setGroupLevels(selectedGroup, { delayMs })}
+                />
+              </Hint>
+              {action(
+                selectedGroup.muted ? "Unmute" : "Mute",
+                selectedGroup.muted ? <Volume2 size={14} /> : <VolumeX size={14} />,
+                () => setGroupLevels(selectedGroup, { muted: !selectedGroup.muted }),
+                selectedGroup.muted ? "danger" : "secondary",
+                groupsBusy,
+              )}
+              {action("Rename", <Pencil size={14} />, () => setRenaming(selectedGroup.id))}
+              {action("Ungroup", <Ungroup size={14} />, () => ungroup(selectedGroup), "danger", groupsBusy)}
             </>
           )}
         </div>
