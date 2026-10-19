@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@heroui/react";
 import { Server, X } from "lucide-react";
 import { AmpConfigureView } from "./AmpConfigureView";
+import { DeviceListView } from "./DeviceListView";
 import { OperatorView } from "./OperatorView";
 import { PresetsView } from "./PresetsView";
 import { WorkspaceView } from "./WorkspaceView";
@@ -19,7 +20,7 @@ import { commands, type AmpAssignment, type AmpModelCatalogEntry, type Project }
 interface ProjectWorkspaceProps {
   project: Project;
   onProjectUpdate: (project: Project) => void;
-  /** Workspace/Operator View/Presets selection — owned by `App` since the tab
+  /** Workspace/Operator View/Presets/Device List selection — owned by `App` since the tab
    * selector itself now renders in the title bar, not here. */
   activeTab: string | null;
   onActiveTabChange: (tab: string | null) => void;
@@ -200,6 +201,18 @@ export function ProjectWorkspace({ project, onProjectUpdate, activeTab, onActive
           )}
           {activeTab === "operator" && <OperatorView />}
           {activeTab === "presets" && <PresetsView project={project} ampModels={ampModels} />}
+          {activeTab === "devices" && (
+            <DeviceListView
+              project={project}
+              onProjectUpdate={onProjectUpdate}
+              ampModels={ampModels}
+              devices={devices}
+              telemetryById={telemetryById}
+              channelConfigById={channelConfigById}
+              locks={locks}
+              onOpenDevice={openDevice}
+            />
+          )}
           {activeDevice && (
             <AmpConfigureView
               activeTab={configureTabById[activeDevice.id] ?? "main"}

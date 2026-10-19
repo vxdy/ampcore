@@ -115,6 +115,12 @@ function App() {
               >
                 Presets
               </Button>
+              <Button
+                variant={workspaceTab === "devices" ? "primary" : "ghost"}
+                onPress={() => setWorkspaceTab("devices")}
+              >
+                Device List
+              </Button>
             </ButtonGroup>
           ) : undefined
         }
